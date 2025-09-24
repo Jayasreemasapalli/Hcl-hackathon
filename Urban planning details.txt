@@ -1,0 +1,598 @@
+// project structure
+smartcity-planner/
+│
+├─ backend/
+│   ├─ app.py                # FastAPI backend entry point
+│   ├─ requirements.txt
+│   ├─ db/
+│   │   ├─ database.py       # PostGIS connection
+│   │   └─ models.sql        # SQL schema
+│   ├─ data_ingestion/
+│   │   ├─ fetch_api.py      # Fetch data from government APIs
+│   │   └─ preprocess.py     # Clean & convert to GeoDataFrame
+│   ├─ analysis/
+│   │   ├─ spatial_ops.py    # GeoPandas spatial analysis
+│   │   └─ ai_recommend.py   # GPT-4/Gemini calls
+│   ├─ reports/
+│   │   └─ generate_report.py# PDF/HTML report generation
+│   └─ utils/
+│       └─ config.py         # API keys & settings
+│
+└─ frontend/
+    ├─ package.json
+    ├─ src/
+    │   ├─ App.js
+    │   ├─ components/
+    │   │   ├─ MapView.js
+    │   │   └─ Sidebar.js
+    │   └─ services/
+    │       └─ api.js
+    └─ public/index.html
+//Back end requirements
+fastapi
+uvicorn[standard]
+psycopg2-binary
+sqlalchemy
+geoalchemy2
+geopandas
+shapely
+requests
+pandas
+python-dotenv
+google-genai
+reportlab
+//back end/config.py
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://postgres:postgres@db:5432/smartcity")
+DATAGOV_API_KEY = os.getenv("DATAGOV_API_KEY")  # data.gov.in key
+BHUVAN_BASE = os.getenv("BHUVAN_BASE", "https://bhuvan-app1.nrsc.gov.in/api")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # set per Google GenAI instructions
+//backend/db/init_db.sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TABLE IF NOT EXISTS population (
+  id SERIAL PRIMARY KEY,
+  source VARCHAR(128),
+  city VARCHAR(128),
+  population BIGINT,
+  geom geometry(Polygon,4326)
+);
+
+CREATE TABLE IF NOT EXISTS roads (
+  id SERIAL PRIMARY KEY,
+  source VARCHAR(128),
+  name TEXT,
+  geom geometry(LINESTRING,4326)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_results (
+  id SERIAL PRIMARY KEY,
+  name TEXT,
+  created_at TIMESTAMP DEFAULT now(),
+  result JSONB
+);
+//backend/db/db.py
+from sqlalchemy import create_engine, text
+from config import POSTGRES_URL
+engine = create_engine(POSTGRES_URL, pool_size=5, max_overflow=10)
+
+def init_db():
+    with engine.begin() as conn:
+        sql = open("db/init_db.sql").read()
+        conn.execute(text(sql))
+//backend/ingestion/fetch_datagov.py
+import requests
+import pandas as pd
+from config import DATAGOV_API_KEY
+
+# Example: endpoint pattern (data.gov.in provides a dataset API endpoint)
+# You must replace DATASET_ID with actual dataset id from data.gov.in
+DATASET_ID = "sample-dataset-id"  # replace with actual
+
+def fetch_datagov_dataset(dataset_id=DATASET_ID, limit=100):
+    base = f"https://api.data.gov.in/resource/{dataset_id}"
+    headers = {"api-key": DATAGOV_API_KEY}
+    params = {"limit": limit, "offset": 0}
+    rows = []
+    while True:
+        resp = requests.get(base, headers=headers, params=params)
+        resp.raise_for_status()
+        j = resp.json()
+        records = j.get("records", [])
+        if not records:
+            break
+        rows.extend(records)
+        if len(records) < limit:
+            break
+        params["offset"] += limit
+    df = pd.DataFrame(rows)
+    return df
+//backend/ingestion/fetch_bhuvan.py
+import requests
+import geopandas as gpd
+from shapely import wkt
+from config import BHUVAN_BASE
+
+def fetch_bhuvan_layer(layer_name, bbox=None):
+    # Bhuvan has thematic endpoints and also WMS/WFS; adapt the URL based on Bhuvan docs
+    # Example thematic download (this is illustrative — consult Bhuvan API docs for exact params)
+    url = f"{BHUVAN_BASE}/thematic/feature"  # change to actual endpoint per docs
+    params = {"layer": layer_name}
+    if bbox:
+        params["bbox"] = ",".join(map(str,bbox))
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+    # convert data to GeoDataFrame depending on returned format (GeoJSON preferred)
+    if "features" in data:
+        gdf = gpd.GeoDataFrame.from_features(data["features"])
+        gdf.set_crs(epsg=4326, inplace=True)
+        return gdf
+    # fallback: parse other formats
+    raise RuntimeError("Unexpected Bhuvan response format; check endpoint & params")
+//backend/ingestion/fetch_osm.py
+import requests
+import geopandas as gpd
+import json
+from shapely.geometry import LineString
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+def fetch_roads_bbox(min_lat, min_lon, max_lat, max_lon):
+    q = f"""
+    [out:json][timeout:25];
+    (
+      way["highway"]({min_lat},{min_lon},{max_lat},{max_lon});
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    r = requests.post(OVERPASS_URL, data=q)
+    r.raise_for_status()
+    data = r.json()
+    # Convert OSM json to GeoDataFrame (simple converter)
+    nodes = {n["id"]:(n["lat"], n["lon"]) for n in data["elements"] if n["type"]=="node"}
+    ways = [e for e in data["elements"] if e["type"]=="way"]
+    rows = []
+    for w in ways:
+        coords = [nodes[nid] for nid in w["nodes"] if nid in nodes]
+        if len(coords) >= 2:
+            rows.append({
+                "id_osm": w["id"],
+                "tags": w.get("tags", {}),
+                "geometry": LineString([(lon, lat) for lat, lon in coords])
+            })
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+    return gdf
+//backend/processing/preprocess.py
+import geopandas as gpd
+from shapely.geometry import Polygon, Point
+from db.db import engine
+
+def datagov_pop_to_gdf(df, lat_col="latitude", lon_col="longitude", pop_col="population", city_col="city"):
+    # If dataset has point coordinates
+    df = df.dropna(subset=[lat_col, lon_col])
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col].astype(float), df[lat_col].astype(float)), crs="EPSG:4326")
+    # aggregate by city polygon if you have polygons: this is example for points
+    return gdf
+
+def write_gdf_to_postgis(gdf, table_name):
+    gdf.to_postgis(table_name, engine, if_exists='append', index=False)
+//backend/processing/spatial_analysis.py
+import geopandas as gpd
+import pandas as pd
+from shapely.ops import unary_union
+
+def compute_population_density(pop_gdf, area_gdf):
+    # area_gdf: polygons (wards / census blocks)
+    joined = gpd.sjoin(area_gdf, pop_gdf, predicate='contains', how='left')
+    agg = joined.groupby('index_left').agg({'population':'sum'}).rename(columns={'population':'pop_sum'})
+    area_gdf = area_gdf.join(agg, how='left')
+    area_gdf['pop_sum'] = area_gdf['pop_sum'].fillna(0)
+    area_gdf['area_km2'] = area_gdf.geometry.to_crs(epsg=3857).area/1e6
+    area_gdf['pop_density'] = area_gdf['pop_sum'] / area_gdf['area_km2']
+    return area_gdf
+
+def roads_density(roads_gdf, area_gdf):
+    # length of roads per area
+    roads_gdf = roads_gdf.to_crs(epsg=3857)
+    area_gdf = area_gdf.to_crs(epsg=3857)
+    joined = gpd.overlay(roads_gdf, area_gdf, how='intersection')
+    joined['length_m'] = joined.geometry.length
+    agg = joined.groupby('area_id').length_m.sum().reset_index()
+    return agg
+//backend/ai/gemini_client.py
+# gemini_client.py
+from google import genai
+from config import GEMINI_API_KEY
+
+# Initialize client (depends on local environment & genai package version).
+# Many deployments use GOOGLE_API_KEY or service account; adjust auth as per docs.
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def generate_recommendation(prompt_text, model="gemini-2.5-flash"):
+    # Keep prompt concise and include structured context JSON
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt_text
+    )
+    # response structure may vary; adapt to client version
+    return response.text if hasattr(response, "text") else response
+//backend/reports/report_gen.py
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
+def generate_pdf_report(title, body_text, filename="report.pdf"):
+    doc = SimpleDocTemplate(filename)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(title, styles['Title']), Spacer(1,12), Paragraph(body_text, styles['Normal'])]
+    doc.build(story)
+    return filename
+//backend/app.py
+from fastapi import FastAPI, BackgroundTasks
+from db.db import init_db, engine
+from ingestion.fetch_datagov import fetch_datagov_dataset
+from ingestion.fetch_bhuvan import fetch_bhuvan_layer
+from ingestion.fetch_osm import fetch_roads_bbox
+from processing.preprocess import datagov_pop_to_gdf, write_gdf_to_postgis
+from processing.spatial_analysis import compute_population_density
+from ai.gemini_client import generate_recommendation
+from reports.report_gen import generate_pdf_report
+import geopandas as gpd
+import json
+
+app = FastAPI()
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+@app.post("/ingest/datagov/{dataset_id}")
+def ingest_datagov(dataset_id: str):
+    df = fetch_datagov_dataset(dataset_id, limit=500)
+    # assume dataset has lat/lon/population
+    gdf = datagov_pop_to_gdf(df, lat_col="latitude", lon_col="longitude", pop_col="population")
+    write_gdf_to_postgis(gdf, "population")
+    return {"status":"ok", "rows":len(gdf)}
+
+@app.post("/ingest/bhuvan/{layer}")
+def ingest_bhuvan(layer: str):
+    gdf = fetch_bhuvan_layer(layer)
+    # example: if polygons representing wards or LULC
+    write_gdf_to_postgis(gdf, "population")  # adapt table/columns
+    return {"status":"ok","rows":len(gdf)}
+
+@app.post("/ingest/osm/roads")
+def ingest_osm(min_lat: float, min_lon: float, max_lat: float, max_lon: float):
+    roads = fetch_roads_bbox(min_lat, min_lon, max_lat, max_lon)
+    write_gdf_to_postgis(roads, "roads")
+    return {"status":"ok","rows":len(roads)}
+
+@app.get("/analyze/zone_density")
+def analyze_zone_density():
+    # load data from PostGIS for example
+    pop = gpd.read_postgis("SELECT * FROM population", engine, geom_col='geom')
+    # assume you have area polygons e.g. wards in PostGIS (table 'wards')
+    wards = gpd.read_postgis("SELECT * FROM wards", engine, geom_col='geom')
+    res = compute_population_density(pop, wards)
+    # store analysis
+    res_json = res.to_json()
+    return {"analysis": json.loads(res_json)}
+    
+@app.post("/ai/recommend")
+def ai_recommend(background_tasks: BackgroundTasks, summary: dict):
+    # summary: structured metrics from frontend or analysis
+    prompt = "Urban-planning recommendation request:\n" + json.dumps(summary)
+    ai_text = generate_recommendation(prompt)
+    # optionally build PDF
+    pdf_file = generate_pdf_report("Recommendation", ai_text, filename="latest_recommendation.pdf")
+    return {"recommendation": ai_text, "report": pdf_file}
+//frontend/package.json
+{
+  "name":"smartcity-frontend",
+  "version":"1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "leaflet": "^1.9.4",
+    "react-leaflet": "^4.2.1"
+  },
+  "scripts": {
+    "start": "react-scripts start"
+  }
+}
+//frontend/src/services/api.js
+const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
+
+export async function getRecommendation(summary){
+  const res = await fetch(`${API_BASE}/ai/recommend`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(summary)
+  });
+  return await res.json();
+}
+
+export async function loadGeojsonFromServer(sqlEndpoint){
+  // You should create an endpoint that returns GeoJSON for the requested layer
+}
+//frontend/src/components/mapview.js
+import { MapContainer, TileLayer, GeoJSON } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import React from 'react';
+
+export default function MapView({ geojson }) {
+  return (
+    <MapContainer center={[17.3850,78.4867]} zoom={12} style={{height:"100vh", width:"100%"}}>
+      <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+      {geojson && <GeoJSON data={geojson} />}
+    </MapContainer>
+  );
+}
+//frontend/src/components/sidebar.js
+import React, { useState } from 'react';
+import { getRecommendation } from '../services/api';
+
+export default function Sidebar(){
+  const [result, setResult] = useState(null);
+
+  const doRecommend = async () => {
+    // build a sample summary; in real UI you will derive this from analysis endpoints
+    const summary = { city: "City X", budget_million: 50, zones: [{name:"Zone A", pop_density:12000, traffic_index:8}] };
+    const r = await getRecommendation(summary);
+    setResult(r.recommendation);
+  };
+
+  return (
+    <div style={{width:360,padding:12}}>
+      <button onClick={doRecommend}>Get AI Recommendation</button>
+      <pre>{result}</pre>
+    </div>
+  );
+}
+//frontend/src/app.js
+import React from 'react';
+import MapView from './components/MapView';
+import Sidebar from './components/Sidebar';
+
+function App(){
+  // for quick demo, no geojson loaded
+  return (
+    <div style={{display:'flex'}}>
+      <Sidebar/>
+      <div style={{flex:1}}>
+        <MapView/>
+      </div>
+    </div>
+  );
+}
+export default App;
+//docker-compose.yml
+version: '3.8'
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: smartcity
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    depends_on:
+      - db
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@db:5432/smartcity
+      - DATAGOV_API_KEY=${DATAGOV_API_KEY}
+      - BHUVAN_BASE=https://bhuvan-app1.nrsc.gov.in/api
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_BASE=http://localhost:8000
+
+volumes:
+  pgdata:
+//backend/dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+//frontend/dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+//create .env(in project root) with:
+DATAGOV_API_KEY=your_datagov_key_here
+GEMINI_API_KEY=your_gemini_key_here
+// services
+docker-compose up --build
+//backend API
+http://localhost:8000/docs
+//frontend UI
+http://localhost:3000
+//example: working ingestion for hyderabad wards
+//backend/ingestion/ingest_ward.py
+# backend/ingestion/ingest_wards.py
+import geopandas as gpd
+from sqlalchemy import text
+from db.db import engine
+import os
+
+def load_wards_geojson(filepath: str, source: str="Hyderabad_Wards"):
+    """
+    Loads ward geometries from a GeoJSON or shapefile into PostGIS wards table.
+    filepath: path to local geojson or shapefile
+    source: string to mark the source of the data
+    """
+
+    # Read the file
+    if filepath.lower().endswith((".json", ".geojson")):
+        gdf = gpd.read_file(filepath)
+    else:
+        # assume shapefile or other formats supported by GeoPandas
+        gdf = gpd.read_file(filepath)
+
+    # Ensure CRS is EPSG:4326
+    if gdf.crs is None:
+        print("Input file missing CRS; assuming EPSG:4326")
+        gdf = gdf.set_crs(epsg=4326)
+    else:
+        # reproject if needed
+        if gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
+
+    # Check what property names exist; adapt to your file
+    # e.g., ward number might be "ward_no", "Ward_No", "WARD", etc.
+    possible_wardno = ['ward_no', 'Ward_No', 'WARD_NO', 'wardno', 'Wardno', 'ward', 'WARD']
+    possible_wardname = ['ward_name', 'Ward_Name', 'WARD_NAME', 'NAME', 'WARDNAME', 'wardname']
+
+    # Normalize property columns
+    def find_col(cols, options):
+        for o in options:
+            if o in cols:
+                return o
+        return None
+
+    cols = gdf.columns
+    ward_no_col = find_col(cols, possible_wardno)
+    ward_name_col = find_col(cols, possible_wardname)
+
+    if ward_no_col is None:
+        raise RuntimeError(f"Could not find ward number column in {list(cols)}")
+    if ward_name_col is None:
+        print("Could not find ward name column; setting to empty string")
+        gdf['ward_name'] = ""
+    else:
+        gdf = gdf.rename(columns={ward_name_col: 'ward_name'})
+
+    # Also rename ward_no if needed
+    if ward_no_col != 'ward_no':
+        gdf = gdf.rename(columns={ward_no_col: 'ward_no'})
+    # Only keep needed columns + geometry
+    gdf = gdf[['ward_no', 'ward_name', 'geometry']]
+
+    # Insert into PostGIS
+    # use GeoPandas to_postgis (if installed) or manually via SQL + WKB/WKT
+
+    # For simplicity, drop existing entries from this source
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM wards WHERE source = :src"), {"src":source})
+
+    # Use GeoPandas to insert
+    gdf['source'] = source
+    # Use gdf.to_postgis (GeoPandas >= 0.9) 
+    gdf.to_postgis('wards', engine, if_exists='append', index=False, dtype={'ward_no': 'VARCHAR', 'ward_name':'VARCHAR', 'source':'VARCHAR'})
+    print(f"Inserted {len(gdf)} wards into PostGIS from {filepath}")
+
+if __name__ == "__main__":
+    # Adjust filepath to actual downloaded file
+    filepath = os.getenv("WARDS_FILE", "data/hyderabad_wards.geojson")
+    load_wards_geojson(filepath)
+//backend/app.py
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import text
+from db.db import engine
+import geopandas as gpd
+from shapely import wkb
+import json
+from fastapi.responses import JSONResponse
+
+# existing imports ...
+
+# after existing routes
+
+@app.get("/wards")
+def get_wards():
+    """
+    Returns all Hyderabad wards as GeoJSON
+    """
+    # SQL to fetch wards
+    sql = "SELECT ward_id, ward_no, ward_name, ST_AsGeoJSON(geom) as geojson FROM wards;"
+    with engine.connect() as conn:
+        result = conn.execute(text(sql))
+        features = []
+        for row in result:
+            ward_id = row['ward_id']
+            ward_no = row['ward_no']
+            ward_name = row['ward_name']
+            geom_json = row['geojson']
+            # geojson is string; parse to JSON
+            geom = json.loads(geom_json)
+            feature = {
+                "type": "Feature",
+                "properties": {
+                    "ward_id": ward_id,
+                    "ward_no": ward_no,
+                    "ward_name": ward_name
+                },
+                "geometry": geom
+            }
+            features.append(feature)
+        feature_collection = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+    return JSONResponse(content=feature_collection)
+//frontend/src/services/api.js
+export async function fetchWards() {
+  const res = await fetch(`${API_BASE}/wards`);
+  const j = await res.json();
+  return j;  // GeoJSON FeatureCollection
+}
+//map view.js
+import React, { useEffect, useState } from 'react';
+import { MapContainer, TileLayer, GeoJSON } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import { fetchWards } from '../services/api';
+
+export default function MapView() {
+  const [wardsGeo, setWardsGeo] = useState(null);
+
+  useEffect(() => {
+    fetchWards().then(j => {
+      setWardsGeo(j);
+    }).catch(err => {
+      console.error("Error fetching wards", err);
+    });
+  }, []);
+
+  return (
+    <MapContainer center={[17.3850,78.4867]} zoom={11} style={{height:"100vh", width:"100%"}}>
+      <TileLayer
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+      />
+      {wardsGeo && <GeoJSON data={wardsGeo} style={feature => ({
+          color: "#444",
+          weight: 1,
+          fillColor: "#f2f2f2",
+          fillOpacity: 0.5
+      })} />}
+    </MapContainer>
+  );
+}
